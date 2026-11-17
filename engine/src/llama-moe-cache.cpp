@@ -19,6 +19,15 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+// QNEXT_MOE_MISS_OVERLAP: the host poll of the publish flags
+#include <atomic>
+#include <thread>
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#define QNEXT_CPU_PAUSE() _mm_pause()
+#else
+#define QNEXT_CPU_PAUSE() ((void) 0)
+#endif
 
 namespace {
 
@@ -598,6 +607,11 @@ struct llama_moe_cache::impl {
         // QNEXT_MOE_LOOKAHEAD_DEBUG_DEFER: the batches <= la_flushed have their copies and event record enqueued on U
         // (always == la_last without DEFER); event queries only look at flushed batches
         uint64_t la_flushed = 0;
+
+        // QNEXT_MOE_MISS_OVERLAP: recorded on U after the miss uploads of a copy(), C waits on it before the layer;
+        // mo_dirty: miss uploads were enqueued on U since U was last synchronized (lookahead_drain synchronizes it)
+        ggml_backend_event_t mo_ev = nullptr;
+        bool mo_dirty = false;
     };
 
     // layers of the same device with the same expert tensor layout share the banks and the LRU of a group
@@ -808,8 +822,12 @@ struct llama_moe_cache::impl {
         int32_t il_real = -1;
         int32_t il = -1;
         int64_t n_tok = 0;
+        bool    mo = false;       // QNEXT_MOE_MISS_OVERLAP: take the predicted ids from their publish at the issue
     };
     la_post_t la_pend;
+    // U waits on la_ev_c (recorded on C after the blocking copies and the slot map upload of copy()) before a lookahead
+    // batch, so the link serves the blocking copies first; QNEXT_MOE_MISS_OVERLAP turns it off (M4)
+    bool     la_link_wait = true;
     size_t   la_cap       = 0;     // int32 per pending readback of predicted ids (la_k * la_max_tok)
     int64_t  la_round     = 2;     // see moe_cache_lru::cur_round
     int64_t  la_log_every = 1000;  // rounds between periodic lines without QNEXT_MOE_STATS
@@ -866,6 +884,76 @@ struct llama_moe_cache::impl {
     };
     std::deque<la_defer_t> la_defer_q;
     uint64_t la_deferred = 0, la_defer_fl_wait = 0, la_defer_fl_late = 0, la_defer_fl_drain = 0;
+
+    // QNEXT_MOE_MISS_OVERLAP=1 (default off): overlap the miss uploads of layer L with the tail of the split before
+    // the lookup of layer L.
+    // Graph (llama-graph.cpp build_moe_cache_slots, qwen4exp.cpp): for ubatches of mo_min_tok..mo_max_tok tokens, right
+    // after the router/top-k of layer L a GGML_OP_QNEXT_PUBLISH node writes the selected ids of L to mapped pinned memory
+    // (slot 2L) and bumps a sequence flag; then come the predictor of L + 1 with its own publish (slot 2(L+1) + 1) and the
+    // shared expert of L; then the lookup of L starts the next split as before.
+    // Host: ids_post_split counts the publish nodes of every launched split (mo_expect); the scheduler skips its
+    // synchronize before copy(L) when a publish of L is pending (copy_nosync); copy(L) polls the flag (mo_wait) instead of
+    // waiting for the whole split, plans as before, enqueues the slot map upload on C (stream-ordered after the tail),
+    // issues the miss uploads on U (not C), records mo_ev on U and makes C wait on it (GPU side) before the layer.
+    // Stream invariants (C compute stream, U upload stream; they replace I1 for overlap layers, I2..I6 hold as stated):
+    //  M1 when copy(L) reads the published ids of L, every C kernel that reads an expert slot (the MUL_MAT_ID of layers
+    //     < L) has completed: the publish kernel is a plain launch after them (qnext-publish.cu). The C work still
+    //     running (the tail: predictor, shared expert) reads and writes no slot and no slot map
+    //  M2 the slot map of L is uploaded on C, so it is ordered after the tail of C (its device copy may share memory with
+    //     tensors of the tail) and before the kernels of L
+    //  M3 the miss uploads of L write only the fills of plan(L): victims that are not in flight, not selected by this plan
+    //     (I2/I3 as before); no C kernel enqueued before copy(L) reads them (M1); C reads them only after waiting on
+    //     mo_ev, which is recorded on U after them (the wait site in copy())
+    //  M4 U is in order: the lookahead batch of L + 1, issued after copy(L), follows the miss uploads of L on U; the
+    //     link-wait event on C is not used (it would order U behind the tail of C)
+    //  M5 a C synchronize implies that every miss upload on U has completed (C waited on each mo_ev); lookahead_drain also
+    //     synchronizes U when miss uploads were issued since (mo_dirty), before any bank write/move/park
+    //  M6 the publish flag carries a sequence number per slot (device counter): copy(L) waits for exactly the number of
+    //     publishes of the slot the host has launched, so a value left from an earlier, unconsumed publish is never taken
+    // Ordering audit behind M1: every dependent-launch (PDL) kernel family of this model's decode graphs reaches the
+    // dependency sync (ggml_cuda_pdl_sync) on at least one thread of every non-empty launch (early returns are bounds
+    // checks that block 0 / thread 0 passes), so completion is transitive along the stream and, when the plain-launched
+    // publish kernel runs, every kernel enqueued before it has completed. A future PDL kernel with a path that skips the
+    // sync in every thread would break this argument.
+    bool     mo_build   = false; // the graphs get the publish nodes and the reordered tail (configuration, also --fit)
+    bool     mo_on      = false; // runtime state present (mapped slots, counters, event, upload stream)
+    int32_t  mo_min_tok = 2;     // QNEXT_MOE_MISS_OVERLAP_MIN_TOK (1..8)
+    int32_t  mo_max_tok = 8;     // the smallest MMVQ limit of the cached expert types (la_drain_above)
+    bool     mo_cmp     = false; // QNEXT_MOE_MISS_OVERLAP_DEBUG=1: also the old readback, compared (mismatches counted)
+    uint64_t mo_spin_ns = 0;     // QNEXT_MOE_MISS_OVERLAP_DEBUG_SPIN_US=N: poison the fills (0xFF) and delay U before them
+    bool     mo_skip_wait = false; // QNEXT_MOE_MISS_OVERLAP_DEBUG_SKIP_WAIT=1: NEGATIVE CONTROL, C does not wait on mo_ev
+    void *   mo_host  = nullptr;   // slot k at mo_host + k*GGML_QNEXT_PUBLISH_SLOT: [0] flag, [32..] ids (int32)
+    void *   mo_sdev  = nullptr;   // device address of slot 0
+    void *   mo_cdev  = nullptr;   // device counters, one uint32 per slot
+    ggml_backend_t mo_be = nullptr; // the device backend the buffers belong to
+    ggml_backend_event_t mo_flush = nullptr; // queried while a poll is long (a driver flush), the device's mo_ev
+    typedef void (*mo_free_fn_t)(ggml_backend_t, void *, void *);
+    mo_free_fn_t mo_free_fn = nullptr;
+    std::vector<uint32_t> mo_expect; // [2*n_layer] publishes launched per slot (cumulative, wraps)
+    std::vector<uint32_t> mo_taken;  // [2*n_layer] the publish count consumed last
+    std::vector<int32_t>  mo_n;      // [2*n_layer] elements of the last launched publish of the slot
+    std::vector<int32_t>  mo_ntok;   // [2*n_layer] rows (ne[1]) of its source tensor
+    std::vector<int32_t>  mo_dbg;    // DEBUG scratch
+    bool     mo_layer = false;       // the copy() running now uses the published ids
+    struct mo_acc {
+        uint64_t pub_ids = 0, pub_pred = 0;     // publish nodes launched (ids / predicted ids)
+        uint64_t ids_taken = 0, pred_taken = 0; // consumed by copy() / by a lookahead issue
+        uint64_t ready = 0;                     // flag already set when the host looked
+        uint64_t polled = 0;                    // the host had to poll
+        int64_t  poll_ns = 0, poll_max_ns = 0;  // host time spent polling
+        uint64_t pred_missing = 0;              // lookahead issue without a pending predicted publish (not issued)
+        uint64_t no_publish = 0;                // copy() of an overlap-size ubatch without a launched publish (old path)
+        uint64_t miss_batches = 0, miss_bytes = 0; // miss uploads on U
+        uint64_t c_waits = 0, skipped_waits = 0;   // C waits on mo_ev; omitted by the negative control
+        uint64_t dbg_cmp = 0, dbg_bad = 0, dbg_pred_cmp = 0, dbg_pred_bad = 0; // DEBUG comparisons and mismatches
+        uint64_t poisoned = 0;                  // DEBUG_SPIN_US: fill runs poisoned before their upload
+        uint64_t flushes = 0;                   // event queries issued during long polls (every 100 us after 100 us)
+        uint64_t flush_released = 0;            // polls that ended within 20 us after a flush query (WDDM held the work)
+        uint64_t poll_hist[5] = {};             // polls ending < 10 us, < 50 us, < 200 us, < 1 ms, >= 1 ms
+        uint64_t disabled = 0;                  // runtime disables (mo_runtime_disable)
+    };
+    mo_acc mo_st;
+    mo_acc mo_prev;
 
     struct la_acc {
         uint64_t rounds = 0;      // evaluations of <= la_max_tok tokens through the cache
@@ -1359,6 +1447,183 @@ struct llama_moe_cache::impl {
         if (la_build && !no_alloc) {
             lookahead_init();
         }
+
+        // QNEXT_MOE_MISS_OVERLAP: configuration after the lookahead's (it needs its upload stream), runtime after it
+        mo_config(no_alloc);
+        if (mo_build && !no_alloc) {
+            mo_init();
+        }
+    }
+
+    // QNEXT_MOE_MISS_OVERLAP: environment and configuration-only checks (no allocation); combinations not reasoned through
+    // are refused with one line and the switch stays off (graphs and every path as without it)
+    void mo_config(bool no_alloc) {
+        const char * v = getenv("QNEXT_MOE_MISS_OVERLAP");
+        if (v == nullptr || *v == '\0' || strcmp(v, "0") == 0) {
+            return;
+        }
+        if (strcmp(v, "1") != 0) {
+            // only 0 and 1 exist in this engine; any other value is refused (the switch stays off)
+            LLAMA_LOG_WARN("%s: qnext_miss_overlap: QNEXT_MOE_MISS_OVERLAP=%s refused: the value must be 0 or 1; the miss uploads "
+                "stay on the compute stream (no publish nodes)\n", __func__, v);
+            return;
+        }
+        auto env_i = [](const char * name, int def) {
+            const char * s = getenv(name);
+            return s != nullptr && *s != '\0' ? atoi(s) : def;
+        };
+        auto env_on = [](const char * name) {
+            const char * s = getenv(name);
+            return s != nullptr && strcmp(s, "1") == 0;
+        };
+        mo_min_tok   = std::clamp(env_i("QNEXT_MOE_MISS_OVERLAP_MIN_TOK", 2), 1, 8);
+        mo_max_tok   = std::min<int32_t>(8, la_drain_above);
+        mo_cmp       = env_on("QNEXT_MOE_MISS_OVERLAP_DEBUG");
+        mo_spin_ns   = (uint64_t) std::clamp(env_i("QNEXT_MOE_MISS_OVERLAP_DEBUG_SPIN_US", 0), 0, 100000)*1000ull;
+        mo_skip_wait = env_on("QNEXT_MOE_MISS_OVERLAP_DEBUG_SKIP_WAIT");
+        const char * why = nullptr;
+        if (!la_build) {
+            why = "QNEXT_MOE_LOOKAHEAD must be on and accepted (the miss uploads use its upload stream; see its log line)";
+        } else if (!batch_copy) {
+            why = "QNEXT_MOE_BATCH_COPY=1 is required";
+        } else if (la_defer) {
+            why = "QNEXT_MOE_LOOKAHEAD_DEBUG_DEFER=1 (its two-copy() rule assumes the scheduler's synchronize before copy())";
+        } else if (timing_mode == 2) {
+            why = "QNEXT_MOE_TIMING=2 (it synchronizes the compute stream after the miss uploads)";
+        } else if (cpu_share > 0.0f || n_zero > 0) {
+            why = "--moe-cache-cpu-share > 0";
+        } else if (const char * go = getenv("GGML_CUDA_GRAPH_OPT"); go != nullptr && atoi(go) == 1) {
+            why = "GGML_CUDA_GRAPH_OPT=1 (concurrent streams inside a split: the publish would not follow every earlier node, M1)";
+        } else if (mo_min_tok > mo_max_tok) {
+            why = "QNEXT_MOE_MISS_OVERLAP_MIN_TOK is above the MMVQ batch limit of the cached expert types";
+        } else if ((int64_t) n_expert_used*mo_max_tok > GGML_QNEXT_PUBLISH_MAX || (int64_t) la_k*la_max_tok > GGML_QNEXT_PUBLISH_MAX) {
+            why = "more ids per layer than one publish slot holds";
+        } else if (mo_skip_wait && mo_spin_ns == 0) {
+            why = "QNEXT_MOE_MISS_OVERLAP_DEBUG_SKIP_WAIT=1 needs QNEXT_MOE_MISS_OVERLAP_DEBUG_SPIN_US > 0 (else it proves nothing)";
+        }
+        if (why != nullptr) {
+            LLAMA_LOG_WARN("%s: qnext_miss_overlap: QNEXT_MOE_MISS_OVERLAP=1 refused: %s; the miss uploads stay on the compute "
+                "stream (no publish nodes)\n", __func__, why);
+            return;
+        }
+        mo_build = true;
+        // M4: U is in order behind the miss uploads; the compute-stream event would make U wait for the tail of C
+        la_link_wait = false;
+        GGML_UNUSED(no_alloc);
+    }
+
+    // QNEXT_MOE_MISS_OVERLAP: mapped slots, device counters, the event; stays off (graphs unchanged) on failure
+    void mo_init() {
+        const char * why = nullptr;
+        device * dp = nullptr;
+        for (device & d : devices) {
+            if (d.host_bytes > 0) {
+                dp = &d;
+            }
+        }
+        typedef bool (*mo_alloc_fn_t)(ggml_backend_t, size_t, void **, void **, void **);
+        mo_alloc_fn_t alloc_fn = nullptr;
+        if (!la_on || dp == nullptr || dp->upload == nullptr) {
+            why = "the lookahead upload stream is not present (see the qnext_moe_lookahead lines)";
+        } else {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(dp->backend));
+            alloc_fn   = reg ? (mo_alloc_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_qnext_publish_alloc") : nullptr;
+            mo_free_fn = reg ? (mo_free_fn_t)  ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_qnext_publish_free") : nullptr;
+            if (alloc_fn == nullptr || mo_free_fn == nullptr) {
+                why = "the backend has no ggml_backend_cuda_qnext_publish_alloc/free";
+            } else if (mo_spin_ns > 0 && (la_spin == nullptr || la_memset == nullptr)) {
+                why = "QNEXT_MOE_MISS_OVERLAP_DEBUG_SPIN_US needs ggml_backend_cuda_spin_async and ggml_backend_cuda_memset2d_async";
+            } else if (batch_fn == nullptr) {
+                why = "no batched copy function (QNEXT_MOE_BATCH_COPY)";
+            }
+        }
+        // slots [0, 2 n_layer): slot 2 il the selected ids of layer il, slot 2 il + 1 the predicted ids of layer il
+        const size_t n_slots = 2*layers.size();
+        if (why == nullptr && !alloc_fn(dp->backend, n_slots, &mo_host, &mo_sdev, &mo_cdev)) {
+            why = "the mapped pinned slots or the device counters could not be allocated";
+        }
+        if (why == nullptr) {
+            dp->mo_ev = ggml_backend_event_new(ggml_backend_get_device(dp->backend));
+            if (dp->mo_ev == nullptr) {
+                why = "no event for the device";
+            }
+        }
+        if (why != nullptr) {
+            LLAMA_LOG_WARN("%s: qnext_miss_overlap: QNEXT_MOE_MISS_OVERLAP=1 refused: %s; the miss uploads stay on the compute "
+                "stream (no publish nodes)\n", __func__, why);
+            mo_free();
+            mo_build     = false;
+            la_link_wait = true;
+            return;
+        }
+        mo_be    = dp->backend;
+        mo_flush = dp->mo_ev;
+        mo_expect.assign(n_slots, 0);
+        mo_taken.assign(n_slots, 0);
+        mo_n.assign(n_slots, 0);
+        mo_ntok.assign(n_slots, 0);
+        mo_on = true;
+        LLAMA_LOG_INFO("%s: qnext_miss_overlap: QNEXT_MOE_MISS_OVERLAP=1: ubatches of %d..%d tokens: the selected ids of a layer "
+            "are published to mapped pinned memory right after its router, the predictor of the next layer and the shared "
+            "expert run after that, the host polls the publish (no synchronize before the copy callback), the miss uploads "
+            "go on the upload stream and the compute stream waits on their event; %zu slots, %.1f KiB mapped; lookahead link "
+            "wait off\n", __func__, mo_min_tok, mo_max_tok, n_slots, n_slots*GGML_QNEXT_PUBLISH_SLOT/1024.0);
+        if (mo_cmp) {
+            LLAMA_LOG_WARN("%s: qnext_miss_overlap: DEBUG=1: every published id list is also read back the old way (after the "
+                "split, with a synchronize) and compared; mismatches are counted and the old ids are used\n", __func__);
+        }
+        if (mo_spin_ns > 0) {
+            LLAMA_LOG_WARN("%s: qnext_miss_overlap: DEBUG_SPIN_US=%llu: the fill slots are set to 0xFF and the upload stream is "
+                "delayed before every miss upload batch\n", __func__, (unsigned long long) (mo_spin_ns/1000));
+        }
+        if (mo_skip_wait) {
+            LLAMA_LOG_WARN("%s: qnext_miss_overlap: ********************************************************************\n", __func__);
+            LLAMA_LOG_WARN("%s: qnext_miss_overlap: DEBUG_SKIP_WAIT=1: NEGATIVE CONTROL, the compute stream does NOT wait for\n", __func__);
+            LLAMA_LOG_WARN("%s: qnext_miss_overlap: the miss uploads: OUTPUTS ARE EXPECTED TO BE WRONG. Test use only.\n", __func__);
+            LLAMA_LOG_WARN("%s: qnext_miss_overlap: ********************************************************************\n", __func__);
+        }
+    }
+
+    // QNEXT_MOE_MISS_OVERLAP: U must be idle (lookahead_drain in the destructor synchronizes it first)
+    void mo_free() {
+        for (device & d : devices) {
+            if (d.mo_ev != nullptr) {
+                ggml_backend_event_free(d.mo_ev);
+                d.mo_ev = nullptr;
+            }
+        }
+        if (mo_free_fn != nullptr && (mo_host != nullptr || mo_cdev != nullptr)) {
+            mo_free_fn(mo_be != nullptr ? mo_be : devices[0].backend, mo_host, mo_cdev);
+        }
+        mo_host = mo_sdev = mo_cdev = nullptr;
+        mo_flush = nullptr;
+        mo_on = false;
+    }
+
+    // before any graph is built (e.g. an eval callback is set): the switch is off for the context, graphs as without it
+    void miss_overlap_refuse(const char * reason) {
+        if (!mo_build && !mo_on) {
+            return;
+        }
+        LLAMA_LOG_WARN("%s: qnext_miss_overlap: QNEXT_MOE_MISS_OVERLAP=1 refused: %s; the miss uploads stay on the compute "
+            "stream (no publish nodes)\n", __func__, reason);
+        mo_on        = false;
+        mo_build     = false;
+        la_link_wait = true;
+    }
+
+    // the publish bookkeeping no longer matches the device (e.g. a split failed after some of its nodes ran): the rest of
+    // the context takes the synchronized path. Graphs built from now on get no publish nodes; graphs built before (and
+    // reused while their topology repeats) keep them: their publishes still execute, nothing reads them
+    void mo_runtime_disable(const char * reason) {
+        if (!mo_on) {
+            return;
+        }
+        LLAMA_LOG_WARN("llama_moe_cache: qnext_miss_overlap: disabled for the rest of the context: %s; the copies are "
+            "synchronized as without the switch from now on\n", reason);
+        mo_on = false;
+        mo_st.disabled++;
+        mo_build = false;
     }
 
     // QNEXT_MOE_LOOKAHEAD: environment and configuration-only checks (no allocation)
@@ -1711,10 +1976,17 @@ struct llama_moe_cache::impl {
         // QNEXT_MOE_LOOKAHEAD: the split whose copy() deferred the lookahead was just launched. Since that
         // copy() no plan ran and no slot changed state (the launch runs no cache code), and C reads only the slots of that
         // plan until the next copy(): the exclusion set of the victim search is the one copy() would have used (I1, I2)
+        // QNEXT_MOE_MISS_OVERLAP (M6): the publishes of the split just launched
+        if (mo_on) {
+            mo_scan(info->graph);
+        }
         if (la_pend.active && info->graph == la_pend.graph && info->backend == la_pend.backend) {
             la_pend.active = false;
-            lookahead_issue(la_pend.il_real, la_pend.il, la_pend.n_tok);
-            la_post_issued++;
+            // QNEXT_MOE_MISS_OVERLAP: the predicted ids come from their publish (in the tail before the lookup of il_real)
+            if (!la_pend.mo || mo_take_pred(la_pend.il, la_pend.n_tok)) {
+                lookahead_issue(la_pend.il_real, la_pend.il, la_pend.n_tok);
+                la_post_issued++;
+            }
         }
         // the pending readbacks were for the split launched now: its copy() has used them, or never will
         ids_async_reset();
@@ -1735,6 +2007,10 @@ struct llama_moe_cache::impl {
             }
             const ggml_tensor * dst = info->next_input_copies[i];
             if (dst == nullptr) {
+                continue;
+            }
+            // QNEXT_MOE_MISS_OVERLAP: the ids of this lookup were published (copy() takes them); DEBUG also reads them back
+            if (mo_pending(il, 0) && !mo_cmp) {
                 continue;
             }
             // the lookup of this slot map in the next split, as copy() finds it
@@ -2363,6 +2639,9 @@ struct llama_moe_cache::impl {
             lookahead_timing_read();
             log_lookahead("final     ", false);
         }
+        // QNEXT_MOE_MISS_OVERLAP: U was synchronized by the drain above (M5), the context synchronized C before
+        mo_log("final     ", false);
+        mo_free();
         // before the members free the banks
         lookahead_free();
         if (trace != nullptr) {
@@ -2470,6 +2749,188 @@ struct llama_moe_cache::impl {
         return la_req;
     }
 
+    //
+    // QNEXT_MOE_MISS_OVERLAP, see the member comment for the invariants M1..M6
+    //
+
+    // the graph publishes the ids of layer il for a ubatch of n_tokens rows: configuration, cache layout and n_tokens only
+    bool miss_overlap(int32_t il, int64_t n_tokens) const {
+        return mo_build && n_tokens >= mo_min_tok && n_tokens <= mo_max_tok &&
+            get_slot_map(il, n_tokens, n_expert_used, false) != nullptr;
+    }
+
+    ggml_tensor * miss_overlap_publish(ggml_context * ctx, ggml_tensor * a, int32_t il, int kind) const {
+        GGML_ASSERT(mo_build && il >= 0 && il < (int32_t) layers.size() && (kind == 0 || kind == 1));
+        if (!ggml_is_contiguous(a)) {
+            a = ggml_cont(ctx, a);
+        }
+        const size_t k = 2*(size_t) il + (size_t) kind;
+        // no_alloc (--fit) graphs are never computed: no buffers there
+        void * slot = mo_sdev != nullptr ? (void *) ((char *) mo_sdev + k*GGML_QNEXT_PUBLISH_SLOT) : nullptr;
+        void * ctr  = mo_cdev != nullptr ? (void *) ((uint32_t *) mo_cdev + k) : nullptr;
+        ggml_tensor * pub = ggml_qnext_publish(ctx, a, slot, ctr, il, kind);
+        ggml_format_name(pub, "qnext_publish%d-%d", kind, il);
+        return pub;
+    }
+
+    bool mo_pending(int32_t il, int kind) const {
+        const size_t k = 2*(size_t) il + (size_t) kind;
+        return mo_on && il >= 0 && k < mo_expect.size() && mo_expect[k] != mo_taken[k];
+    }
+
+    // the scheduler may skip its synchronize before copy() of this slot map: copy() will take the published ids (M1, M2)
+    bool copy_nosync(const ggml_tensor * src) const {
+        if (!mo_on) {
+            return false;
+        }
+        const auto it = layer_of.find(src);
+        return it != layer_of.end() && !it->second.second && mo_pending(it->second.first, 0);
+    }
+
+    // after the launch of a split: count its publish nodes (each launched node executes exactly once, M6)
+    void mo_scan(const ggml_cgraph * graph) {
+        if (graph == nullptr) {
+            return;
+        }
+        const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(graph));
+        for (int i = 0; i < n_nodes; ++i) {
+            const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(graph), i);
+            if (node->op != GGML_OP_QNEXT_PUBLISH) {
+                continue;
+            }
+            const int32_t * p = (const int32_t *) node->op_params;
+            const int32_t il = p[4], kind = p[5];
+            const size_t k = 2*(size_t) il + (size_t) kind;
+            GGML_ASSERT(il >= 0 && (kind == 0 || kind == 1) && k < mo_expect.size());
+            mo_expect[k]++;
+            mo_n[k]    = p[6];
+            mo_ntok[k] = (int32_t) node->src[0]->ne[1];
+            (kind == 0 ? mo_st.pub_ids : mo_st.pub_pred)++;
+        }
+    }
+
+    // wait until slot k holds its newest launched publish (M6); nullptr (and the switch disabled for the rest of the
+    // context, mo_runtime_disable) when the device is ahead of the launches the host counted, or after 2 s without it.
+    // Poll policy: pause-spin (no yield) for the first 2 ms (a yield could hand the core to another ready thread for a
+    // whole time slice; the draft does not run during a verify round, so the spinning thread competes with nothing it
+    // waits for). From 100 us on, one non-blocking event query every 100 us (a WDDM flush, in case submitted work is held
+    // in the driver queue); polls that end within 20 us after such a query are counted (flush_released). After 2 ms the
+    // thread yields on every poll
+    const int32_t * mo_wait(size_t k) {
+        volatile const uint32_t * flag = (volatile const uint32_t *) ((const char *) mo_host + k*GGML_QNEXT_PUBLISH_SLOT);
+        const uint32_t target = mo_expect[k];
+        uint32_t v = *flag;
+        int64_t ns = 0;
+        if (v == target) {
+            mo_st.ready++;
+        } else {
+            const clk::time_point t0 = clk::now();
+            int64_t last_flush = -1;
+            for (uint64_t it = 0;; ++it) {
+                v = *flag;
+                if (v == target) {
+                    break;
+                }
+                if ((int32_t) (v - target) > 0) {
+                    // e.g. a split whose launch failed after some of its nodes had run
+                    char why[160];
+                    snprintf(why, sizeof(why), "publish slot %zu holds sequence %u, ahead of the %u launches counted", k, v, target);
+                    mo_runtime_disable(why);
+                    return nullptr;
+                }
+                if ((it & 63) == 0) {
+                    ns = ns_between(t0, clk::now());
+                    if (ns >= 100000ll && (last_flush < 0 || ns - last_flush >= 100000ll) && la_query != nullptr && mo_flush != nullptr) {
+                        (void) la_query(mo_flush);
+                        mo_st.flushes++;
+                        last_flush = ns;
+                    }
+                    if (ns > 2000000000ll) {
+                        // no abort: the synchronized path takes over (its readback waits for the stream)
+                        char why[160];
+                        snprintf(why, sizeof(why), "the publish of slot %zu (layer %zu, kind %zu) did not arrive within 2 s "
+                            "(seen %u, want %u)", k, k/2, k%2, v, target);
+                        mo_runtime_disable(why);
+                        return nullptr;
+                    }
+                }
+                if (ns < 2000000ll) {
+                    QNEXT_CPU_PAUSE();
+                } else {
+                    std::this_thread::yield();
+                }
+            }
+            ns = ns_between(t0, clk::now());
+            mo_st.polled++;
+            mo_st.poll_ns += ns;
+            mo_st.poll_max_ns = std::max(mo_st.poll_max_ns, ns);
+            if (last_flush >= 0 && ns - last_flush < 20000ll) {
+                mo_st.flush_released++;
+            }
+        }
+        mo_st.poll_hist[ns < 10000 ? 0 : ns < 50000 ? 1 : ns < 200000 ? 2 : ns < 1000000 ? 3 : 4]++;
+        // the ids were written before the flag (system-scope fences on the device): read them after the flag
+        std::atomic_thread_fence(std::memory_order_acquire);
+        mo_taken[k] = target;
+        return (const int32_t *) ((const char *) mo_host + k*GGML_QNEXT_PUBLISH_SLOT) + GGML_QNEXT_PUBLISH_DATA;
+    }
+
+    // the predicted ids of layer il (published in the tail before the lookup of il - 1) into la_pred; false if none pending
+    bool mo_take_pred(int32_t il, int64_t n_tok) {
+        if (!mo_pending(il, 1)) {
+            mo_st.pred_missing++;
+            return false;
+        }
+        const size_t k = 2*(size_t) il + 1;
+        const int32_t n = mo_n[k], ntok = mo_ntok[k];
+        const int32_t * src = mo_wait(k);
+        if (src == nullptr || ntok < 1 || ntok > n_tok || (int64_t) n != (int64_t) la_k*ntok) {
+            mo_st.pred_missing++;
+            return false;
+        }
+        la_pred.assign(src, src + n);
+        la_pred_ntok = ntok;
+        mo_st.pred_taken++;
+        return true;
+    }
+
+    void mo_log(const char * what, bool interval) {
+        if (!mo_on && mo_st.disabled == 0) {
+            return;
+        }
+        mo_acc d = mo_st;
+        if (interval) {
+            const mo_acc & p = mo_prev;
+            d.pub_ids -= p.pub_ids; d.pub_pred -= p.pub_pred; d.ids_taken -= p.ids_taken; d.pred_taken -= p.pred_taken;
+            d.ready -= p.ready; d.polled -= p.polled; d.poll_ns -= p.poll_ns; d.pred_missing -= p.pred_missing;
+            d.no_publish -= p.no_publish; d.miss_batches -= p.miss_batches; d.miss_bytes -= p.miss_bytes;
+            d.c_waits -= p.c_waits; d.skipped_waits -= p.skipped_waits; d.dbg_cmp -= p.dbg_cmp; d.dbg_bad -= p.dbg_bad;
+            d.dbg_pred_cmp -= p.dbg_pred_cmp; d.dbg_pred_bad -= p.dbg_pred_bad; d.poisoned -= p.poisoned;
+            d.flushes -= p.flushes; d.flush_released -= p.flush_released; d.disabled -= p.disabled;
+            for (int b = 0; b < 5; ++b) {
+                d.poll_hist[b] -= p.poll_hist[b];
+            }
+            mo_prev = mo_st;
+        }
+        LLAMA_LOG_INFO("llama_moe_cache: qnext_miss_overlap: %s: round %lld: publishes launched = %llu ids + %llu predicted, "
+            "taken = %llu ids + %llu predicted, flag ready on arrival = %llu, polled = %llu (%.3f ms total, max %.1f us), "
+            "predicted missing = %llu, overlap-size copies without a publish = %llu, miss batches on U = %llu (%.2f MiB), "
+            "compute waits = %llu, skipped waits = %llu | debug: compared %llu ids lists (%llu mismatches), %llu predicted "
+            "(%llu mismatches), poisoned runs = %llu, long-poll flushes = %llu\n",
+            what, (long long) la_round, (unsigned long long) d.pub_ids, (unsigned long long) d.pub_pred,
+            (unsigned long long) d.ids_taken, (unsigned long long) d.pred_taken, (unsigned long long) d.ready,
+            (unsigned long long) d.polled, d.poll_ns*1e-6, mo_st.poll_max_ns*1e-3, (unsigned long long) d.pred_missing,
+            (unsigned long long) d.no_publish, (unsigned long long) d.miss_batches, d.miss_bytes/1024.0/1024.0,
+            (unsigned long long) d.c_waits, (unsigned long long) d.skipped_waits, (unsigned long long) d.dbg_cmp,
+            (unsigned long long) d.dbg_bad, (unsigned long long) d.dbg_pred_cmp, (unsigned long long) d.dbg_pred_bad,
+            (unsigned long long) d.poisoned, (unsigned long long) d.flushes);
+        LLAMA_LOG_INFO("llama_moe_cache: qnext_miss_overlap: %s: polls ending <10us %llu, <50us %llu, <200us %llu, <1ms %llu, "
+            ">=1ms %llu; polls released within 20 us of a flush query = %llu; runtime disables = %llu%s\n",
+            what, (unsigned long long) d.poll_hist[0], (unsigned long long) d.poll_hist[1], (unsigned long long) d.poll_hist[2],
+            (unsigned long long) d.poll_hist[3], (unsigned long long) d.poll_hist[4], (unsigned long long) d.flush_released,
+            (unsigned long long) d.disabled, mo_on ? "" : " (now off)");
+    }
+
     // the drain reasons are string literals, compared by content
     void la_count_drain(const char * reason) {
         for (auto & r : la_drains) {
@@ -2496,7 +2957,14 @@ struct llama_moe_cache::impl {
             if (d.upload != nullptr && d.la_last > d.la_done) {
                 ggml_backend_synchronize(d.upload);
                 d.la_done = d.la_last;
+                d.mo_dirty = false;
                 any = true;
+            }
+            // QNEXT_MOE_MISS_OVERLAP (M5): miss uploads on U complete before any bank write/move/park that follows a drain
+            // (not counted as a drain reason: with the switch unset mo_dirty is never set)
+            if (d.upload != nullptr && d.mo_dirty) {
+                ggml_backend_synchronize(d.upload);
+                d.mo_dirty = false;
             }
         }
         for (group & g : groups) {
@@ -2764,8 +3232,10 @@ struct llama_moe_cache::impl {
 
             // ordering: U after the blocking copies and the slot map upload of copy(il_real), so the link serves them first;
             // la_ev_c was recorded in copy(). Not needed for safety: U writes only victims, which C does not touch before
-            // copy(il) (I1, I2)
-            ggml_backend_event_wait(d.upload, d.la_ev_c);
+            // copy(il) (I1, I2). Off with QNEXT_MOE_MISS_OVERLAP (M4: U is in order behind the miss uploads already)
+            if (la_link_wait) {
+                ggml_backend_event_wait(d.upload, d.la_ev_c);
+            }
             const int tb = la_tev(d.upload);
 
             if (la_debug) {
@@ -2970,6 +3440,13 @@ struct llama_moe_cache::impl {
         const bool la_cls_ok = la_on && n_tok >= la_min_tok && n_tok <= la_max_tok; // counted in the lookahead lines
         int64_t la_ns_other = 0;
         la_have = false;
+        // QNEXT_MOE_MISS_OVERLAP: a publish of these ids was launched, so the scheduler did not synchronize C before this
+        // call (copy_nosync answers with the same test; nothing changes it in between): C may still run the tail (M1)
+        mo_layer = mo_pending(il, 0);
+        bool mo_pred_now = false; // DEBUG: the predicted ids were taken (and compared) here already
+        if (mo_on && !mo_layer && !has_cpu && n_tok >= mo_min_tok && n_tok <= mo_max_tok) {
+            mo_st.no_publish++;
+        }
         if (la_on) {
             const clk::time_point tq = clk::now();
             // DEBUG_DEFER: the batches issued two or more copy() calls ago (C, synchronized by the scheduler before this
@@ -3007,6 +3484,7 @@ struct llama_moe_cache::impl {
                 }
                 if (la_round % la_log_every == 0) {
                     log_lookahead("interval  ", true);
+                    mo_log("interval  ", true);
                 }
             }
             if (g.la_ok) {
@@ -3023,7 +3501,55 @@ struct llama_moe_cache::impl {
         // QNEXT_IDS_ASYNC: the readback was enqueued right after the producing split; wait for its event only (it has
         // completed already when the scheduler synchronized the backend before this callback)
         bool ids_done = false;
-        if (ia.on) {
+        const int32_t * pub = nullptr;
+        if (mo_layer) {
+            const size_t k = 2*(size_t) il;
+            if ((size_t) mo_n[k] != ids.size()) {
+                GGML_ABORT("qnext_miss_overlap: layer %d published %d ids, the lookup reads %zu", il, mo_n[k], ids.size());
+            }
+            pub = mo_wait(k);
+            if (pub == nullptr) {
+                // the switch is off now; the scheduler did not synchronize C before this call, the synchronous readback
+                // below does (no async readback was enqueued for this lookup)
+                mo_layer = false;
+            }
+        }
+        if (mo_layer) {
+            // QNEXT_MOE_MISS_OVERLAP: the published ids (M1: every C kernel that reads a slot has completed when they are
+            // visible); the predicted ids of layer il + 1 follow in the tail, taken at the lookahead issue (mo_take_pred)
+            memcpy(ids.data(), pub, ids.size()*sizeof(int32_t));
+            ids_done = true;
+            mo_st.ids_taken++;
+            if (la_on && mo_pending(il + 1, 1)) {
+                la_have = true; // filled by mo_take_pred before the issue
+            }
+            if (mo_cmp) {
+                // DEBUG: the old readback of the same tensors (enqueued after the split by ids_post_split), after its event
+                const ids_async_state::pending * p = ids_async_take(sel, il);
+                if (p != nullptr && p->n == ids.size()) {
+                    ggml_backend_event_synchronize(ia.ev);
+                    mo_st.dbg_cmp++;
+                    if (memcmp(ids.data(), p->dst, ids.size()*sizeof(int32_t)) != 0) {
+                        mo_st.dbg_bad++;
+                        memcpy(ids.data(), p->dst, ids.size()*sizeof(int32_t)); // the old ids are the reference
+                    }
+                    if (la_have && p->la_n > 0) {
+                        mo_dbg.assign(p->la_dst, p->la_dst + p->la_n);
+                        if (mo_take_pred(il + 1, n_tok)) {
+                            mo_pred_now = true;
+                            mo_st.dbg_pred_cmp++;
+                            if (la_pred != mo_dbg || la_pred_ntok != p->la_ntok) {
+                                mo_st.dbg_pred_bad++;
+                                la_pred      = mo_dbg;
+                                la_pred_ntok = p->la_ntok;
+                            }
+                        } else {
+                            la_have = false;
+                        }
+                    }
+                }
+            }
+        } else if (ia.on) {
             const ids_async_state::pending * p = ids_async_take(sel, il);
             if (p != nullptr && p->n == ids.size()) {
                 ggml_backend_event_synchronize(ia.ev);
@@ -3096,8 +3622,10 @@ struct llama_moe_cache::impl {
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
         if (timed) { t3 = clk::now(); }
+        // QNEXT_MOE_MISS_OVERLAP: the miss uploads go on U (M3), C keeps running the tail of the previous split
+        ggml_backend_t up = mo_layer ? devices[g.id].upload : backend;
         if (copy_mark_fn != nullptr) {
-            copy_mark_fn(copy_mark_ud, backend, 0); // QNEXT_STEP_EVENTS: before the miss uploads
+            copy_mark_fn(copy_mark_ud, up, mo_layer ? 2 : 0); // QNEXT_STEP_EVENTS: before the miss uploads
         }
         size_t bytes = 0;
         // QNEXT_MOE_BATCH_COPY: collect the copies of the layer and issue them with one batched call
@@ -3120,13 +3648,26 @@ struct llama_moe_cache::impl {
                 while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {
                     n++;
                 }
+                if (mo_layer && mo_spin_ns > 0) {
+                    // QNEXT_MOE_MISS_OVERLAP_DEBUG_SPIN_US: the fill is 0xFF until its upload (U, before the delay below)
+                    if (!la_memset(up, (char *) bank->data + fills[i].slot*expert_size, n*expert_size, 0xFF, n*expert_size, 1)) {
+                        GGML_ABORT("qnext_miss_overlap: DEBUG_SPIN_US: poisoning a fill slot failed");
+                    }
+                    mo_st.poisoned++;
+                }
                 if (batching) {
                     bc_items.push_back({bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size});
                 } else {
-                    ggml_backend_tensor_set_async(backend, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
+                    ggml_backend_tensor_set_async(up, bank, (const uint8_t *) w->data + fills[i].expert*expert_size, fills[i].slot*expert_size, n*expert_size);
                 }
                 bytes += n*expert_size;
                 i += n;
+            }
+        }
+        if (mo_layer && mo_spin_ns > 0 && !fills.empty()) {
+            // QNEXT_MOE_MISS_OVERLAP_DEBUG_SPIN_US: U is held back after the poison, so a missing C wait reads 0xFF slots
+            if (!la_spin(up, mo_spin_ns)) {
+                GGML_ABORT("qnext_miss_overlap: DEBUG_SPIN_US: the delay kernel failed");
             }
         }
         if (batching && !bc_items.empty()) {
@@ -3143,7 +3684,7 @@ struct llama_moe_cache::impl {
                     bc_sizes[k] = bc_items[k].size;
                     bc_bytes   += bc_items[k].size;
                 }
-                done = batch_fn(backend, bc_dsts.data(), bc_srcs.data(), bc_sizes.data(), bc_items.size());
+                done = batch_fn(up, bc_dsts.data(), bc_srcs.data(), bc_sizes.data(), bc_items.size());
                 if (done) {
                     bc_calls++;
                     bc_copies += bc_items.size();
@@ -3154,12 +3695,20 @@ struct llama_moe_cache::impl {
             }
             if (!done) {
                 for (const bc_item & it : bc_items) {
-                    ggml_backend_tensor_set_async(backend, it.bank, it.src, it.offset, it.size);
+                    ggml_backend_tensor_set_async(up, it.bank, it.src, it.offset, it.size);
                 }
             }
         }
         if (copy_mark_fn != nullptr) {
-            copy_mark_fn(copy_mark_ud, backend, 1); // QNEXT_STEP_EVENTS: after the miss uploads
+            copy_mark_fn(copy_mark_ud, up, mo_layer ? 3 : 1); // QNEXT_STEP_EVENTS: after the miss uploads
+        }
+        // QNEXT_MOE_MISS_OVERLAP (M3): the event C waits on below, recorded on U after every miss upload of this layer
+        if (mo_layer && !fills.empty()) {
+            device & d = devices[g.id];
+            ggml_backend_event_record(d.mo_ev, up);
+            d.mo_dirty = true;
+            mo_st.miss_batches++;
+            mo_st.miss_bytes += bytes;
         }
 
         // QNEXT_MOE_LOOKAHEAD, I4: the plan selected slots whose lookahead upload may still run: C waits (GPU side, the host
@@ -3221,6 +3770,21 @@ struct llama_moe_cache::impl {
         } else {
             ggml_backend_tensor_set_async(backend, dst, l.slot_map->data, 0, ggml_nbytes(l.slot_map));
         }
+        // QNEXT_MOE_MISS_OVERLAP (M2): the slot map upload above is on C, so it is ordered after the tail still running on C;
+        // the next copy() of layer il writes the staging copy only after it saw a later publish of layer il on C, i.e.
+        // after this upload executed.
+        // Wait site of M3: no kernel of this layer may read a fill before its upload on U has completed; C waits (GPU
+        // side, the host does not block) on the event recorded on U after the miss uploads, after the slot map upload and
+        // before the split's kernels. Layers without misses have nothing on U to wait for (the lookahead slots they select
+        // are covered by the I4 wait above)
+        if (mo_layer && !fills.empty()) {
+            if (!mo_skip_wait) {
+                ggml_backend_event_wait(backend, devices[g.id].mo_ev);
+                mo_st.c_waits++;
+            } else {
+                mo_st.skipped_waits++; // QNEXT_MOE_MISS_OVERLAP_DEBUG_SKIP_WAIT: negative control
+            }
+        }
 
         // QNEXT_MOE_LOOKAHEAD: plan and issue layer il + 1 now that the blocking copies and the slot map upload of layer il are
         // enqueued on C (the staging copy of this slot map is taken: admission may change its unselected entries freely)
@@ -3237,7 +3801,10 @@ struct llama_moe_cache::impl {
                 la_pend.il_real  = il;
                 la_pend.il       = il + 1;
                 la_pend.n_tok    = n_tok;
-                ggml_backend_event_record(devices[groups[layers[il + 1].ig].id].la_ev_c, backend);
+                la_pend.mo       = mo_layer && !mo_pred_now; // QNEXT_MOE_MISS_OVERLAP: take the publish at the issue
+                if (la_link_wait) {
+                    ggml_backend_event_record(devices[groups[layers[il + 1].ig].id].la_ev_c, backend);
+                }
             } else if (want) {
                 la_st[n_tok == 1 ? 0 : 1].no_readback++; // the graph should have the predictor: its ids were not read back
             } else if (la_have && la_cls_ok) {
@@ -3467,6 +4034,32 @@ void llama_moe_cache::ids_post_split(const ggml_backend_sched_split_info * info)
 
 void llama_moe_cache::ids_async_reset() {
     pimpl->ids_async_reset();
+    // QNEXT_MOE_MISS_OVERLAP: before a graph evaluation, a publish launched by an earlier evaluation whose copy() never ran
+    // (an aborted evaluation) is not pending anymore, so a later lookup without a publish of its own is synchronized as
+    // before. The flags keep counting (M6): the next publish of the slot is waited for by its own sequence number
+    if (pimpl->mo_on) {
+        pimpl->mo_taken = pimpl->mo_expect;
+    }
+}
+
+bool llama_moe_cache::miss_overlap(int32_t il, int64_t n_tokens) const {
+    return pimpl->miss_overlap(il, n_tokens);
+}
+
+ggml_tensor * llama_moe_cache::miss_overlap_publish(ggml_context * ctx, ggml_tensor * ids, int32_t il, int kind) const {
+    return pimpl->miss_overlap_publish(ctx, ids, il, kind);
+}
+
+bool llama_moe_cache::miss_overlap_enabled() const {
+    return pimpl->mo_on;
+}
+
+bool llama_moe_cache::copy_nosync(const ggml_tensor * src) const {
+    return pimpl->copy_nosync(src);
+}
+
+void llama_moe_cache::miss_overlap_refuse(const char * reason) {
+    pimpl->miss_overlap_refuse(reason);
 }
 
 void llama_moe_cache::set_copy_mark_hook(void (*fn)(void * ud, ggml_backend_t backend, int which), void * ud) {

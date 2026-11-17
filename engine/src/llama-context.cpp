@@ -694,6 +694,11 @@ llama_context::llama_context(
             }
             moe_cache = std::make_unique<llama_moe_cache>(model, model.no_alloc(), backend_ptrs, backend_buft, cparams.moe_cache_size,
                     cparams.moe_cache_cpu_share, elastic_layout, elastic_lend_bytes + el_cmp_va);
+            // QNEXT_MOE_MISS_OVERLAP: an eval callback can stop a split after some of its nodes, while the publish
+            // bookkeeping counts every publish node of a launched split; refused before any graph is built
+            if (cparams.cb_eval != nullptr) {
+                moe_cache->miss_overlap_refuse("an eval callback is set (it can stop a split after part of its nodes)");
+            }
         }
 
         if (!elastic_kvs.empty()) {
@@ -931,6 +936,10 @@ void llama_context::sched_new(const sched_params & params) {
             backend_ptrs.data(), sched_bufts.data(), backend_ptrs.size(), params.max_nodes, params.parallel, params.op_offload));
 
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+    // QNEXT_MOE_MISS_OVERLAP: only with the switch active (no callback otherwise: the scheduler synchronizes as before)
+    if (moe_cache && moe_cache->miss_overlap_enabled()) {
+        ggml_backend_sched_set_copy_nosync_callback(sched.get(), sched_copy_nosync, this);
+    }
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 
     // QNEXT_COMPUTE_FILL (debug) shares the allocation and buffer free callbacks
@@ -4454,7 +4463,8 @@ struct llama_context::step_events_state {
     std::vector<void *> pool;
     size_t n_used = 0;
 
-    enum kind : uint8_t { SPLIT_BEGIN, SPLIT_END, COPY_BEGIN, COPY_END };
+    // MISS_U_*: QNEXT_MOE_MISS_OVERLAP, the miss uploads of copy() on the upload stream U (not the compute stream)
+    enum kind : uint8_t { SPLIT_BEGIN, SPLIT_END, COPY_BEGIN, COPY_END, MISS_U_BEGIN, MISS_U_END };
     struct mark {
         uint8_t  kind;
         uint32_t ev;
@@ -4473,6 +4483,10 @@ struct llama_context::step_events_state {
         int64_t rounds = 0;
         double span = 0, exec = 0, copy = 0, idle_pre = 0, idle_post = 0, idle_split = 0, host_sync = 0;
         int64_t syncs = 0, splits = 0, copies = 0;
+        // QNEXT_MOE_MISS_OVERLAP: miss upload batches on U, from the event before the batch (host issue time) to the
+        // event after it; with the switch the compute stream's wait for them shows up as idle between splits
+        double copy_u = 0;
+        int64_t copies_u = 0;
     };
     acc cum[2];
     acc prev[2];
@@ -4516,10 +4530,20 @@ struct llama_context::step_events_state {
             return ms;
         };
         acc r;
-        int first_begin = -1, last_end = -1, cur_begin = -1, cx = -1, cy = -1, cb = -1;
+        int first_begin = -1, last_end = -1, cur_begin = -1, cx = -1, cy = -1, cb = -1, ub = -1;
         for (const mark & m : marks) {
             const int e = (int) m.ev;
             switch (m.kind) {
+                case MISS_U_BEGIN:
+                    ub = e;
+                    break;
+                case MISS_U_END:
+                    if (ub >= 0) {
+                        r.copy_u += el(ub, e);
+                        r.copies_u++;
+                    }
+                    ub = -1;
+                    break;
                 case COPY_BEGIN:
                     cx = cx < 0 ? e : cx;
                     cb = e;
@@ -4569,6 +4593,7 @@ struct llama_context::step_events_state {
                 d.rounds -= p.rounds; d.span -= p.span; d.exec -= p.exec; d.copy -= p.copy; d.idle_pre -= p.idle_pre;
                 d.idle_post -= p.idle_post; d.idle_split -= p.idle_split; d.host_sync -= p.host_sync; d.syncs -= p.syncs;
                 d.splits -= p.splits; d.copies -= p.copies;
+                d.copy_u -= p.copy_u; d.copies_u -= p.copies_u;
             }
             if (d.rounds <= 0) {
                 continue;
@@ -4580,6 +4605,13 @@ struct llama_context::step_events_state {
                 what, c == 0 ? "ubatch=1" : "ubatch=2..32", (long long) d.rounds, d.span/r, d.exec/r, d.copy/r,
                 (d.idle_pre + d.idle_post + d.idle_split)/r, d.idle_pre/r, d.idle_post/r, d.idle_split/r,
                 d.host_sync/r, d.syncs/r, d.splits/r, d.copies/r, (long long) sample_every, (long long) incomplete);
+            // QNEXT_MOE_MISS_OVERLAP: only when such batches were timed (the line above is unchanged)
+            if (d.copies_u > 0) {
+                LLAMA_LOG_INFO("llama_context: qnext_step_events: %s: %s: miss_overlap: per-round ms: miss_copy_u=%.3f (batches=%.2f), "
+                    "exposed_wait=%.3f (compute stream idle between splits: the part of the miss uploads and host work not "
+                    "hidden behind the tails)\n", what, c == 0 ? "ubatch=1" : "ubatch=2..32", d.copy_u/r, d.copies_u/r,
+                    (d.idle_pre + d.idle_post + d.idle_split)/r);
+            }
         }
         if (interval) {
             prev[0] = cum[0];
@@ -4605,6 +4637,7 @@ struct llama_context::step_events_state {
         a.rounds += r.rounds; a.span += r.span; a.exec += r.exec; a.copy += r.copy; a.idle_pre += r.idle_pre;
         a.idle_post += r.idle_post; a.idle_split += r.idle_split; a.host_sync += r.host_sync; a.syncs += r.syncs;
         a.splits += r.splits; a.copies += r.copies;
+        a.copy_u += r.copy_u; a.copies_u += r.copies_u;
         const int64_t total = cum[0].rounds + cum[1].rounds;
         if (total - rounds_logged >= log_every) {
             rounds_logged = total;
@@ -4707,7 +4740,10 @@ void llama_context::step_events_copy_mark(void * ud, ggml_backend_t backend, int
         return;
     }
     se->used = true;
-    se->record(backend, which == 0 ? step_events_state::COPY_BEGIN : step_events_state::COPY_END);
+    // which: 0/1 before/after the miss uploads on the compute stream, 2/3 (QNEXT_MOE_MISS_OVERLAP) on the upload stream
+    static const step_events_state::kind kinds[4] = { step_events_state::COPY_BEGIN, step_events_state::COPY_END,
+        step_events_state::MISS_U_BEGIN, step_events_state::MISS_U_END };
+    se->record(backend, kinds[which >= 0 && which < 4 ? which : 1]);
 }
 
 void llama_context::sched_split_cb(enum ggml_backend_sched_split_phase phase, const ggml_backend_sched_split_info * info, void * user_data) {
@@ -4858,6 +4894,11 @@ ggml_status llama_context::graph_compute(
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+bool llama_context::sched_copy_nosync(const ggml_tensor * src, void * user_data) {
+    auto * lctx = static_cast<llama_context *>(user_data);
+    return lctx->moe_cache && lctx->moe_cache->copy_nosync(src);
 }
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {

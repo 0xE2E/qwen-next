@@ -14,7 +14,7 @@ Measured on the machine above at a 90,000-token context window. Tokens per secon
 |---|---|---|
 | llama.cpp seed, original flags (expert cache off, no draft) | ~800 | ~30 |
 | llama.cpp seed, its own flags tuned (`--moe-cache-mib auto --ubatch-size 2048`), no code changes | ~845 | ~44 |
-| **qwen-next, accepted profile (with MTP self-speculation)** | **~1,450** | **~76** |
+| **qwen-next, accepted profile (with MTP self-speculation)** | **~1,480** | **~80** |
 | qwen-next, accepted profile without the draft model | ~1,450 | ~50 |
 
 Read these with care:
@@ -38,6 +38,7 @@ All switches are off by default; the starter script turns on the accepted set.
 | Host round trips | Routing ids are read back without a full stream sync | `QNEXT_IDS_ASYNC` |
 | Draft | The MTP draft pass computes only what it reads; its buffers are cropped and the memory goes to the cache | `QNEXT_MTP_PRUNE`, `QNEXT_MTP_CROP` |
 | Prefetch | While layer L computes, a cheap probe predicts layer L+1's experts and uploads them on a second stream; compute waits on the GPU only if a selected expert is still in flight | `QNEXT_MOE_LOOKAHEAD*` |
+| Transfers | Each layer's routing ids are published from inside the previous layer's graph, so missed experts upload while the rest of that graph still runs; compute waits on the upload's event | `QNEXT_MOE_MISS_OVERLAP` |
 | Sampling | Greedy sampling stays on the GPU | `--backend-sampling` |
 
 Things that were built, measured and shelved are part of the record too: for example a bit-exact kernel fusion that removed about 9% of the kernels per step and changed speed by 0%.

@@ -318,6 +318,9 @@ private:
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
+    // QNEXT_MOE_MISS_OVERLAP: the scheduler's no-sync question for a host weight, see llama_moe_cache::copy_nosync
+    static bool sched_copy_nosync(const ggml_tensor * src, void * user_data);
+
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 

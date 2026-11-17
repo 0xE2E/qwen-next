@@ -1148,9 +1148,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "QNEXT_PUBLISH",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1265,9 +1267,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "qnext_publish(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6762,6 +6766,38 @@ struct ggml_tensor * ggml_dsv4_hc_pre_gated(
         struct ggml_tensor  * gate,
         float                 scale) {
     return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true);
+}
+
+// ggml_qnext_publish (QNEXT_MOE_MISS_OVERLAP)
+
+struct ggml_tensor * ggml_qnext_publish(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        void                * slot_dev,
+        void                * ctr_dev,
+        int32_t               il,
+        int32_t               kind) {
+    GGML_ASSERT(a->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_nelements(a) <= GGML_QNEXT_PUBLISH_MAX);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+
+    // op params (int32 x 16): [0..1] slot_dev, [2..3] ctr_dev, [4] il, [5] kind, [6] elements
+    int32_t params[7] = { 0 };
+    const uint64_t s = (uint64_t) (uintptr_t) slot_dev;
+    const uint64_t c = (uint64_t) (uintptr_t) ctr_dev;
+    memcpy(&params[0], &s, sizeof(s));
+    memcpy(&params[2], &c, sizeof(c));
+    params[4] = il;
+    params[5] = kind;
+    params[6] = (int32_t) ggml_nelements(a);
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_QNEXT_PUBLISH;
+    result->src[0] = a;
+
+    return result;
 }
 
 // ggml_dsv4_hc_post

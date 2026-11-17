@@ -2100,6 +2100,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_glu(params, tensor);
             } break;
+        case GGML_OP_QNEXT_PUBLISH:
+            {
+                // QNEXT_MOE_MISS_OVERLAP: CUDA only, the CPU backend reports it unsupported
+                GGML_ABORT("GGML_OP_QNEXT_PUBLISH is not supported by the CPU backend");
+            }
         case GGML_OP_GET_REL_POS:
             {
                 ggml_compute_forward_get_rel_pos(params, tensor);

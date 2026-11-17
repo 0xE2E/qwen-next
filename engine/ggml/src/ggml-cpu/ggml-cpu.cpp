@@ -429,6 +429,11 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    // QNEXT_MOE_MISS_OVERLAP: CUDA only
+    if (op->op == GGML_OP_QNEXT_PUBLISH) {
+        return false;
+    }
+
     // MXFP8 is a gather-only type: GET_ROWS reads it, nothing else does (and nothing writes it)
     if (op->type == GGML_TYPE_MXFP8) {
         return false;

@@ -551,65 +551,107 @@ llama_model_qwen4exp::graph::graph(const llm_graph_params & params) :
         // softmax; the allocator decrements child counts in node order, so the in-place decisions of the real nodes (all
         // after these nodes) do not change. Not proven bit-identical: the extra allocations can move later tensors, which
         // only matters for the address-dependent fusion checks; correctness is checked by comparing tokens with the switch off
-        if (moe_cache != nullptr && hparams.n_expert_groups <= 1 && il + 1 < n_layer) {
-            const int la_mode = moe_cache->lookahead_mode(il + 1, n_tokens);
-            const auto & ly = model.layers[il + 1];
-            // the scheduler must not see a host weight here (a new split would change the split layout)
-            auto on_device = [](const ggml_tensor * w) {
-                return w == nullptr || (w->buffer != nullptr && !ggml_backend_buffer_is_host(w->buffer));
-            };
-            if (la_mode != 0 && ly.ffn_gate_inp != nullptr && on_device(ly.ffn_gate_inp)) {
-                ggml_tensor * x = nullptr;
-                if (la_mode == 4 && ly.hc_ffn_norm != nullptr && on_device(ly.hc_ffn_norm) && on_device(ly.hc_ffn_down) &&
-                           on_device(ly.hc_ffn_up) && on_device(ly.hc_ffn_down_inject)) {
-                    // the FFN mixer of layer il + 1 on the residual streams the FFN mixer of layer il reads
-                    if (cparams.fused_dsv4_hc_pre && ly.hc_ffn_up != nullptr &&
-                            (ly.hc_ffn_down_inject != nullptr || ly.hc_ffn_down != nullptr)) {
-                        // the same mixer with fewer kernels, predictor nodes only: the
-                        // inject rows of the merged down matrix are not computed (a row view of the weight), and the sigmoid
-                        // gate + stream mean is the fused DSV4_HC_PRE op the real mixers use (not registered with
-                        // add_fused_node: the real mixers already register the op; no cb(), as for the other predictor nodes)
-                        const int64_t hc_n = hparams.dsv4_hc_mult;
-                        const int64_t nt   = res_hc->ne[2];
-                        ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, res_hc, hparams.f_norm_rms_eps), ly.hc_ffn_norm);
-                        xn = ggml_reshape_2d(ctx0, xn, hc_n*n_embd, nt);
-                        ggml_tensor * w_lo = ly.hc_ffn_down;
-                        if (ly.hc_ffn_down_inject != nullptr) {
-                            const int64_t n_lo = ly.hc_ffn_down_inject->ne[1] - hc_n;
-                            w_lo = ggml_view_2d(ctx0, ly.hc_ffn_down_inject, ly.hc_ffn_down_inject->ne[0], n_lo,
-                                    ly.hc_ffn_down_inject->nb[1], 0);
+        // (the block is a lambda only so that QNEXT_MOE_MISS_OVERLAP can expand it later; with the switch unset it is called
+        // right here, so the nodes and their order are exactly as before)
+        auto la_predict = [&](const bool mo_publish) {
+            if (moe_cache != nullptr && hparams.n_expert_groups <= 1 && il + 1 < n_layer) {
+                const int la_mode = moe_cache->lookahead_mode(il + 1, n_tokens);
+                const auto & ly = model.layers[il + 1];
+                // the scheduler must not see a host weight here (a new split would change the split layout)
+                auto on_device = [](const ggml_tensor * w) {
+                    return w == nullptr || (w->buffer != nullptr && !ggml_backend_buffer_is_host(w->buffer));
+                };
+                if (la_mode != 0 && ly.ffn_gate_inp != nullptr && on_device(ly.ffn_gate_inp)) {
+                    ggml_tensor * x = nullptr;
+                    if (la_mode == 4 && ly.hc_ffn_norm != nullptr && on_device(ly.hc_ffn_norm) && on_device(ly.hc_ffn_down) &&
+                               on_device(ly.hc_ffn_up) && on_device(ly.hc_ffn_down_inject)) {
+                        // the FFN mixer of layer il + 1 on the residual streams the FFN mixer of layer il reads
+                        if (cparams.fused_dsv4_hc_pre && ly.hc_ffn_up != nullptr &&
+                                (ly.hc_ffn_down_inject != nullptr || ly.hc_ffn_down != nullptr)) {
+                            // the same mixer with fewer kernels, predictor nodes only: the
+                            // inject rows of the merged down matrix are not computed (a row view of the weight), and the sigmoid
+                            // gate + stream mean is the fused DSV4_HC_PRE op the real mixers use (not registered with
+                            // add_fused_node: the real mixers already register the op; no cb(), as for the other predictor nodes)
+                            const int64_t hc_n = hparams.dsv4_hc_mult;
+                            const int64_t nt   = res_hc->ne[2];
+                            ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, res_hc, hparams.f_norm_rms_eps), ly.hc_ffn_norm);
+                            xn = ggml_reshape_2d(ctx0, xn, hc_n*n_embd, nt);
+                            ggml_tensor * w_lo = ly.hc_ffn_down;
+                            if (ly.hc_ffn_down_inject != nullptr) {
+                                const int64_t n_lo = ly.hc_ffn_down_inject->ne[1] - hc_n;
+                                w_lo = ggml_view_2d(ctx0, ly.hc_ffn_down_inject, ly.hc_ffn_down_inject->ne[0], n_lo,
+                                        ly.hc_ffn_down_inject->nb[1], 0);
+                            }
+                            ggml_tensor * lo = ggml_silu(ctx0, ggml_scale(ctx0, ggml_mul_mat(ctx0, w_lo, xn), 1.0f / (float) hc_n));
+                            ggml_tensor * gate = ggml_mul_mat(ctx0, ly.hc_ffn_up, lo);
+                            x = ggml_dsv4_hc_pre_gated(ctx0,
+                                    ggml_reshape_3d(ctx0, xn,   n_embd, hc_n, nt),
+                                    ggml_reshape_3d(ctx0, gate, n_embd, hc_n, nt), 1.0f / (float) hc_n);
+                        } else {
+                            // without the fused DSV4_HC_PRE op: the full mixer; il = -1 keeps it out of the fused HC ops (and
+                            // out of res->add_fused_node)
+                            x = build_hc_mix(res_hc, ly.hc_ffn_norm, ly.hc_ffn_down, ly.hc_ffn_up, nullptr, ly.hc_ffn_down_inject, -1).cur;
                         }
-                        ggml_tensor * lo = ggml_silu(ctx0, ggml_scale(ctx0, ggml_mul_mat(ctx0, w_lo, xn), 1.0f / (float) hc_n));
-                        ggml_tensor * gate = ggml_mul_mat(ctx0, ly.hc_ffn_up, lo);
-                        x = ggml_dsv4_hc_pre_gated(ctx0,
-                                ggml_reshape_3d(ctx0, xn,   n_embd, hc_n, nt),
-                                ggml_reshape_3d(ctx0, gate, n_embd, hc_n, nt), 1.0f / (float) hc_n);
-                    } else {
-                        // without the fused DSV4_HC_PRE op: the full mixer; il = -1 keeps it out of the fused HC ops (and
-                        // out of res->add_fused_node)
-                        x = build_hc_mix(res_hc, ly.hc_ffn_norm, ly.hc_ffn_down, ly.hc_ffn_up, nullptr, ly.hc_ffn_down_inject, -1).cur;
+                    }
+                    // the last layer runs its FFN on the output rows only (crop_before_nextn above): predict
+                    // those rows only (the readback then has fewer rows than the ubatch, see ids_post_split)
+                    if (x != nullptr && il + 1 == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
+                        x = ggml_get_rows(ctx0, x, inp_out_ids);
+                    }
+                    if (x != nullptr && x->ne[0] == ly.ffn_gate_inp->ne[0]) {
+                        // softmax gating without a selection bias: the top-k of the logits is the top-k of the probabilities
+                        ggml_tensor * logits = ggml_mul_mat(ctx0, ly.ffn_gate_inp, x); // [n_expert, n_rows]
+                        // in descending logit order (argsort + view), contiguous for the readback
+                        ggml_tensor * ids = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, logits, moe_cache->lookahead_k())); // I32 [k, n_rows]
+                        ggml_format_name(ids, "qnext_moe_la%d-%d", la_mode, il + 1);
+                        // an output: the allocator keeps its memory for the readback enqueued after the split
+                        ggml_set_output(ids);
+                        ggml_build_forward_expand(gf, ids);
+                        res->t_moe_pf.push_back({ il + 1, ids });
+                        if (mo_publish) {
+                            // QNEXT_MOE_MISS_OVERLAP: published right after the predictor, in the tail that runs
+                            // after the publish of the real ids of layer il (see the hook below)
+                            ggml_tensor * pub = moe_cache->miss_overlap_publish(ctx0, ids, il + 1, 1);
+                            ggml_backend_sched_set_tensor_backend(sched, pub, moe_cache->backend(il + 1));
+                            ggml_build_forward_expand(gf, pub);
+                        }
                     }
                 }
-                // the last layer runs its FFN on the output rows only (crop_before_nextn above): predict
-                // those rows only (the readback then has fewer rows than the ubatch, see ids_post_split)
-                if (x != nullptr && il + 1 == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
-                    x = ggml_get_rows(ctx0, x, inp_out_ids);
+            }
+        };
+
+        // QNEXT_MOE_MISS_OVERLAP=1 (default off; see llama-moe-cache.cpp): build_moe_cache_slots publishes the selected
+        // ids of layer il to the host right after the router, then calls moe_pre_lookup, which expands the predictor of
+        // layer il + 1 (with a publish of its ids) and the shared expert of layer il: work that does not depend on the
+        // experts of layer il, so it runs at the end of the split that precedes the slot lookup, while the host plans layer
+        // il and the missed experts upload on the second stream. Exactness: only the order of independent nodes changes
+        // (each node reads the same tensors); the shared expert's output is added to the routed output as before
+        if (moe_cache == nullptr || !moe_cache->miss_overlap(il, cur->ne[1])) {
+            la_predict(false);
+            cur = build_layer_ffn(cur, il);
+        } else {
+            ggml_tensor * ffn_in   = cur;
+            ggml_tensor * mo_shexp = nullptr;
+            bool          mo_ran   = false;
+            moe_pre_lookup = [&]() {
+                if (mo_ran) {
+                    return;
                 }
-                if (x != nullptr && x->ne[0] == ly.ffn_gate_inp->ne[0]) {
-                    // softmax gating without a selection bias: the top-k of the logits is the top-k of the probabilities
-                    ggml_tensor * logits = ggml_mul_mat(ctx0, ly.ffn_gate_inp, x); // [n_expert, n_rows]
-                    // in descending logit order (argsort + view), contiguous for the readback
-                    ggml_tensor * ids = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, logits, moe_cache->lookahead_k())); // I32 [k, n_rows]
-                    ggml_format_name(ids, "qnext_moe_la%d-%d", la_mode, il + 1);
-                    // an output: the allocator keeps its memory for the readback enqueued after the split
-                    ggml_set_output(ids);
-                    ggml_build_forward_expand(gf, ids);
-                    res->t_moe_pf.push_back({ il + 1, ids });
+                mo_ran = true;
+                la_predict(true);
+                mo_shexp = build_shexp(ffn_in, il);
+                if (mo_shexp != nullptr) {
+                    ggml_build_forward_expand(gf, mo_shexp);
                 }
+            };
+            cur = build_layer_ffn(ffn_in, il, &mo_shexp);
+            moe_pre_lookup = nullptr;
+            if (!mo_ran) {
+                // build_moe_cache_slots refused the lookup after all (a backend support check): no publish, the predictor
+                // (if any) follows the FFN; nothing reads its ids early in that case
+                la_predict(false);
             }
         }
-
-        cur = build_layer_ffn(cur, il);
         cb(cur, "ffn_out", il);
 
         res_hc = build_hc_combine(res_hc, cur, ffn_mix.inject, il);
@@ -1340,7 +1382,33 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     return cur;
 }
 
-ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il) {
+ggml_tensor * llama_model_qwen4exp::graph::build_shexp(ggml_tensor * cur, const int il) {
+    if (model.layers[il].ffn_up_shexp == nullptr) {
+        return nullptr;
+    }
+    ggml_tensor * ffn_shexp =
+        build_ffn(cur,
+            model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+            model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+            model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+            NULL,
+            LLM_FFN_SILU, LLM_FFN_PAR, il);
+    cb(ffn_shexp, "ffn_shexp", il);
+
+    // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
+    ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+    cb(shared_gate, "shared_expert_gate", il);
+
+    shared_gate = ggml_sigmoid(ctx0, shared_gate);
+    cb(shared_gate, "shared_expert_gate_sigmoid", il);
+
+    ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
+    cb(ffn_shexp, "ffn_shexp_gated", il);
+
+    return ffn_shexp;
+}
+
+ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, const int il, ggml_tensor * const * shexp_pre) {
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
     ggml_tensor * moe_out =
@@ -1360,26 +1428,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             model.layers[il].ffn_down_exps_s);
     cb(moe_out, "ffn_moe_out", il);
 
-    // shared experts, as in the Qwen3Next reference
+    // shared experts, as in the Qwen3Next reference (QNEXT_MOE_MISS_OVERLAP: built before the slot lookup, see build_shexp)
     if (model.layers[il].ffn_up_shexp != nullptr) {
-        ggml_tensor * ffn_shexp =
-            build_ffn(cur,
-                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
-                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
-                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
-        cb(ffn_shexp, "ffn_shexp", il);
-
-        // shared expert has its own sigmoided gate (ffn_gate_inp_shexp, one value per token)
-        ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
-        cb(shared_gate, "shared_expert_gate", il);
-
-        shared_gate = ggml_sigmoid(ctx0, shared_gate);
-        cb(shared_gate, "shared_expert_gate_sigmoid", il);
-
-        ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
-        cb(ffn_shexp, "ffn_shexp_gated", il);
+        ggml_tensor * ffn_shexp = shexp_pre != nullptr && *shexp_pre != nullptr ? *shexp_pre : build_shexp(cur, il);
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);

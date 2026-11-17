@@ -2841,7 +2841,15 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * cur,
                             int   il);
 
+        // shexp_pre (QNEXT_MOE_MISS_OVERLAP): where the slot-lookup hook stores the gated shared expert it built before
+        // the lookup (see build_shexp); nullptr, or nullptr stored: built here after the routed experts, as before
         ggml_tensor * build_layer_ffn(
+                    ggml_tensor * cur,
+                            int   il,
+                    ggml_tensor * const * shexp_pre = nullptr);
+
+        // the shared expert of layer il on cur, gated by its sigmoid gate; nullptr if the layer has none
+        ggml_tensor * build_shexp(
                     ggml_tensor * cur,
                             int   il);
 

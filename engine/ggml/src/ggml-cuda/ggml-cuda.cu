@@ -77,6 +77,7 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
+#include "ggml-cuda/qnext-publish.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -3822,6 +3823,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_TOP_K_MASK:
             ggml_cuda_op_top_k_mask(ctx, dst);
+            break;
+        case GGML_OP_QNEXT_PUBLISH:
+            // QNEXT_MOE_MISS_OVERLAP
+            ggml_cuda_op_qnext_publish(ctx, dst);
             break;
         default:
             return false;
@@ -8067,6 +8072,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
         case GGML_OP_TOP_K_MASK:
             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
+        case GGML_OP_QNEXT_PUBLISH:
+            // QNEXT_MOE_MISS_OVERLAP
+            return ggml_cuda_qnext_publish_supported(op);
 
         default:
             return false;
@@ -8281,6 +8289,13 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_mmvq_mmid_max_batch") == 0) {
         return (void *)ggml_backend_cuda_mmvq_mmid_max_batch;
+    }
+    // QNEXT_MOE_MISS_OVERLAP
+    if (strcmp(name, "ggml_backend_cuda_qnext_publish_alloc") == 0) {
+        return (void *)ggml_backend_cuda_qnext_publish_alloc;
+    }
+    if (strcmp(name, "ggml_backend_cuda_qnext_publish_free") == 0) {
+        return (void *)ggml_backend_cuda_qnext_publish_free;
     }
     // QNEXT_STEP_EVENTS
     if (strcmp(name, "ggml_backend_cuda_timing_event_new") == 0) {

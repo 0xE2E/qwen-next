@@ -23,6 +23,7 @@ Environment:
 QNEXT_MOE_BIGBATCH_BYPASS=1 QNEXT_MOE_BATCH_COPY=1 QNEXT_ELASTIC_KV=3 QNEXT_PF_OVERLAP=1 QNEXT_PF_OVERLAP_SLOTS=3
 QNEXT_IDS_ASYNC=1 QNEXT_MTP_PRUNE=1 QNEXT_MTP_CROP=1 QNEXT_ELASTIC_COMPUTE=1 QNEXT_MOE_LOOKAHEAD=4
 QNEXT_MOE_LOOKAHEAD_MAX_MIB=24 QNEXT_MOE_LOOKAHEAD_RANK=1 QNEXT_MOE_LOOKAHEAD_ISSUE=post QNEXT_MOE_LOOKAHEAD_P4_FAST=1
+QNEXT_MOE_MISS_OVERLAP=1
 ```
 
 ## MoE expert cache and expert uploads
@@ -41,6 +42,7 @@ QNEXT_MOE_LOOKAHEAD_MAX_MIB=24 QNEXT_MOE_LOOKAHEAD_RANK=1 QNEXT_MOE_LOOKAHEAD_IS
 | `QNEXT_MOE_LOOKAHEAD_MIN_LAYER` | >= 1 (2) | First layer that gets a prediction. | tuning |
 | `QNEXT_MOE_LOOKAHEAD_MIN_TOK` | 1..4 (2) | Smallest ubatch that gets a prediction; the default keeps single-token decoding (no draft) unchanged. Values above 4 turn the lookahead off with a warning. | tuning |
 | `QNEXT_MOE_LOOKAHEAD_PROTECT` | `0`/`1` (1) | With 1, slots holding predicted experts that are already cached are never chosen as victims for the same upload batch. | tuning |
+| `QNEXT_MOE_MISS_OVERLAP` | `1` (off) | For ubatches of 2 to 8 tokens, a one-thread kernel publishes each layer's selected expert ids to mapped pinned memory right after the router; the next layer's predictor and the shared expert are moved after that publish, so the host reads the ids without synchronizing the compute stream, uploads the missed experts on the lookahead's upload stream while that tail runs, and the compute stream waits on the upload's event before the layer. Needs `QNEXT_MOE_LOOKAHEAD`, `QNEXT_IDS_ASYNC` and `QNEXT_MOE_BATCH_COPY`; refused (one log line, switch off) with an eval callback, a CPU cache share, `QNEXT_MOE_TIMING=2`, `GGML_CUDA_GRAPH_OPT=1` or `QNEXT_MOE_LOOKAHEAD_DEBUG_DEFER`; any value other than 0 or 1 is refused. If the publish counter runs ahead of the host's count, or a publish does not arrive within 2 s, it turns itself off for the rest of the context and the synchronized path takes over; a published id list whose length differs from what the lookup reads (not possible by construction) stops the process. Tuning: `QNEXT_MOE_MISS_OVERLAP_MIN_TOK` (1..8, 2). Verification: `QNEXT_MOE_MISS_OVERLAP_DEBUG=1` also reads the ids back the old way and counts mismatches (uses the old ids); `QNEXT_MOE_MISS_OVERLAP_DEBUG_SPIN_US=N` fills the miss slots with 0xFF and delays the upload stream by N us before each miss batch; `QNEXT_MOE_MISS_OVERLAP_DEBUG_SKIP_WAIT=1` (needs SPIN_US) is the negative control in which the compute stream does not wait, so output is expected to be wrong. | profile |
 | `QNEXT_PF_OVERLAP` | `1` (off) | Ubatches of more than 32 tokens upload whole host expert tensors into a ring of device slots on a second stream, ahead of the layer that uses them, so uploads overlap compute. With `QNEXT_ELASTIC_KV=3` the ring borrows MoE cache bank memory for the duration of the graph. | profile |
 | `QNEXT_PF_OVERLAP_SLOTS` | 2..8 (2) | Number of ring slots for `QNEXT_PF_OVERLAP`. The profile uses 3. | profile / tuning |
 

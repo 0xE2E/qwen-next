@@ -97,6 +97,8 @@ if ($Stock) {
         $envSet['QNEXT_MOE_LOOKAHEAD_RANK']    = '1'
         $envSet['QNEXT_MOE_LOOKAHEAD_ISSUE']   = 'post'
         $envSet['QNEXT_MOE_LOOKAHEAD_P4_FAST'] = '1'
+        # missed experts upload while the rest of the previous layer's graph still runs
+        $envSet['QNEXT_MOE_MISS_OVERLAP']      = '1'
     } else {
         $srvArgs += @('--spec-type', 'none')
     }

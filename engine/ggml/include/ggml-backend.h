@@ -417,6 +417,13 @@ extern "C" {
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 
+    // QNEXT_MOE_MISS_OVERLAP: asked before the copy callback of a host weight; returning true means the copy callback
+    // orders its own work after the split backend's stream (it enqueues on that stream, and reads what it needs from the
+    // device through its own wait), so the scheduler does NOT synchronize the split backend first. NULL (the default):
+    // always synchronize, as before
+    typedef bool (*ggml_backend_sched_copy_nosync_callback)(const struct ggml_tensor * src, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_copy_nosync_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_nosync_callback callback, void * user_data);
+
     // QNEXT: set the split callback (NULL to clear); time_input_syncs: measure the host time of the synchronizations
     // before the host weight copy callbacks (two clock reads per such input)
     GGML_API void                 ggml_backend_sched_set_split_callback(ggml_backend_sched_t sched, ggml_backend_sched_split_callback callback, bool time_input_syncs, void * user_data);

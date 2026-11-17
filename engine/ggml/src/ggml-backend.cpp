@@ -1231,6 +1231,10 @@ struct ggml_backend_sched {
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
 
+    // QNEXT_MOE_MISS_OVERLAP, see ggml_backend_sched_set_copy_nosync_callback (NULL: always synchronize)
+    ggml_backend_sched_copy_nosync_callback callback_copy_nosync;
+    void * callback_copy_nosync_user_data;
+
     ggml_backend_sched_realloc_callback callback_realloc;
     void * callback_realloc_user_data;
 
@@ -2138,6 +2142,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     // wait for the split backend to finish using the input before overwriting it
     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+    } else if (sched->callback_copy_nosync != NULL && sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
+               sched->callback_copy_nosync(input, sched->callback_copy_nosync_user_data)) {
+        // QNEXT_MOE_MISS_OVERLAP: the copy callback below orders its work itself; the earlier splits keep running
     } else if (sched->split_time_syncs && sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input)) {
         // QNEXT_STEP_EVENTS: the host time blocked in the synchronization before the copy callback
         const auto t0 = std::chrono::steady_clock::now();
@@ -2570,6 +2577,12 @@ void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_copy = callback;
     sched->callback_copy_user_data = user_data;
+}
+
+void ggml_backend_sched_set_copy_nosync_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_nosync_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_copy_nosync           = callback;
+    sched->callback_copy_nosync_user_data = user_data;
 }
 
 void ggml_backend_sched_set_split_callback(ggml_backend_sched_t sched, ggml_backend_sched_split_callback callback, bool time_input_syncs, void * user_data) {

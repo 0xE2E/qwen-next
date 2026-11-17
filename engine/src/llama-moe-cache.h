@@ -66,7 +66,22 @@ public:
     void ids_async_reset();
 
     // QNEXT_STEP_EVENTS: called by copy() right before (which = 0) and after (which = 1) the miss uploads are enqueued
+    // on the compute stream; with QNEXT_MOE_MISS_OVERLAP which = 2 / 3 and backend is the upload stream's backend
     void set_copy_mark_hook(void (*fn)(void * ud, ggml_backend_t backend, int which), void * ud);
+
+    // QNEXT_MOE_MISS_OVERLAP=1 (default off), see llama-moe-cache.cpp
+    // the graph publishes the selected ids of layer il (n_tokens rows) right after its router and expands the work that
+    // does not depend on its experts before its slot lookup; a pure function of the configuration, the cache layout and
+    // n_tokens (false with the switch unset)
+    bool miss_overlap(int32_t il, int64_t n_tokens) const;
+    // the GGML_OP_QNEXT_PUBLISH node of layer il (kind 0: the selected ids, 1: the predicted ids of layer il)
+    ggml_tensor * miss_overlap_publish(ggml_context * ctx, ggml_tensor * ids, int32_t il, int kind) const;
+    // the runtime part is active (llama_context then installs the scheduler's no-sync callback)
+    bool miss_overlap_enabled() const;
+    // for the scheduler: the copy callback of this slot map orders itself (a publish of its ids is pending)
+    bool copy_nosync(const ggml_tensor * src) const;
+    // turn the switch off before any graph is built (reason logged), e.g. when an eval callback is set
+    void miss_overlap_refuse(const char * reason);
 
     // for large batches: copy the experts of w that are in the cache, starting at expert e and up to expert last, to the copy dst of w
     // returns the number of experts copied, 0 if expert e is not in the cache

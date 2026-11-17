@@ -1138,6 +1138,11 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // QNEXT_MOE_MISS_OVERLAP: set by a model around its build_moe_ffn call; build_moe_cache_slots calls it right
+    // after it published the selected ids of a layer and before the slot lookup, so the nodes it expands run between the
+    // two (in the split that precedes the lookup). Empty: nothing is called
+    std::function<void()> moe_pre_lookup;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 

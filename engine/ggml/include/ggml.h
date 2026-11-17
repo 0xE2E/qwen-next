@@ -623,6 +623,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // QNEXT_MOE_MISS_OVERLAP: appended last so that every other op keeps its value
+        GGML_OP_QNEXT_PUBLISH,
+
         GGML_OP_COUNT,
     };
 
@@ -2784,6 +2787,24 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * gate,
             float                 scale);
+
+    // QNEXT_MOE_MISS_OVERLAP (CUDA only): publish the contiguous I32 tensor a (at most GGML_QNEXT_PUBLISH_MAX elements)
+    // to host-mapped pinned memory while the stream keeps running. When the node executes (it waits for every earlier node
+    // of the stream), it writes a to slot_dev + GGML_QNEXT_PUBLISH_DATA int32, then increments the device counter *ctr_dev
+    // and stores the new value in slot_dev[0] (system-scope fence between the data and the flag). slot_dev is the device
+    // pointer of a cudaHostAllocMapped allocation, ctr_dev a device-memory uint32. The result is a 1-element I32 tensor that
+    // is not written (only the side effect matters); il and kind are kept in the op params for the host (layer, 0 = selected
+    // experts, 1 = predicted experts)
+    #define GGML_QNEXT_PUBLISH_DATA 32   // int32 offset of the ids in a slot (the flag is int32 0)
+    #define GGML_QNEXT_PUBLISH_MAX  224  // ids per publish
+    #define GGML_QNEXT_PUBLISH_SLOT 1024 // bytes per slot
+    GGML_API struct ggml_tensor * ggml_qnext_publish(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            void                * slot_dev,
+            void                * ctr_dev,
+            int32_t               il,
+            int32_t               kind);
 
     // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
     //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]

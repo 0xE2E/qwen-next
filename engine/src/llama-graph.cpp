@@ -2791,6 +2791,19 @@ llm_graph_moe_cache_slots llm_graph_context::build_moe_cache_slots(
     ggml_backend_sched_set_tensor_backend(sched, slots, moe_cache->backend(il));
     cb(slots, "ffn_moe_slots", il);
 
+    // QNEXT_MOE_MISS_OVERLAP=1 (default off; see llama-moe-cache.cpp): publish the selected ids to the host now (a
+    // kernel that writes them to mapped pinned memory), then let the model expand the work that does not depend on the
+    // experts of this layer (moe_pre_lookup), all before the lookup: they end the split that precedes the lookup, so they
+    // run while the host plans this layer and the missed experts upload. With the switch unset nothing is added here
+    if (moe_cache->miss_overlap(il, selected_experts->ne[1])) {
+        ggml_tensor * pub = moe_cache->miss_overlap_publish(ctx0, ids, il, 0);
+        ggml_backend_sched_set_tensor_backend(sched, pub, moe_cache->backend(il));
+        ggml_build_forward_expand(gf, pub);
+        if (moe_pre_lookup) {
+            moe_pre_lookup();
+        }
+    }
+
     // add the lookup now: the transform of a Hadamard-folded expert reads host weights and would start its split first
     ggml_build_forward_expand(gf, slots);
 
