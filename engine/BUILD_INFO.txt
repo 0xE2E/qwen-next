@@ -1,0 +1,28 @@
+llama.cpp version: b12340-mix-6186f42
+requested source ref: b12340-mix-6186f42
+resolved source ref: b12340-mix-6186f42
+variant: cuda13-newer
+runtime line: cuda13
+coverage class: newer
+bundle rank: 50
+docker image: github-hosted windows-2022, CUDA 13.3 (NVIDIA redist)
+backend: CUDA
+toolkit version: 13.3
+supported sms: 86,89,90,100,103,120
+nvcc validation: available
+min sm: 86
+max sm: 120
+os: windows
+arch: x64
+build_shared_libs: ON
+ggml_backend_dl: ON
+ggml_cpu_all_variants: ON
+ggml_cuda_nccl: OFF
+rpath: 
+llama_openssl: ON
+openssl_linkage: dynamic
+cxx_runtime: dynamic
+source commit: b8645ddda1dcce4172b413124f8ed85e7466316a
+source commit short: b8645dd
+built at (UTC): 2026-11-13T10:22:29Z
+notes: CUDA 13 newer bundle.

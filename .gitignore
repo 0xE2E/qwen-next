@@ -1,0 +1,20 @@
+# build outputs
+/engine/build*/
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+*.exp
+*.ilk
+# models and local data
+*.gguf
+*.safetensors
+*.bin
+/measurements/
+/build-logs/
+# python / editor
+__pycache__/
+*.pyc
+.vscode/
+.vs/

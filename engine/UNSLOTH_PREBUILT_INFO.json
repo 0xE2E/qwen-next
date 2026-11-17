@@ -1,0 +1,184 @@
+{
+  "requested_tag": "latest",
+  "tag": "b12340",
+  "release_tag": "b12340-mix-6186f42",
+  "published_repo": "unslothai/llama.cpp",
+  "asset": "app-b12340-mix-6186f42-windows-x64-cuda13-newer.zip",
+  "force_cpu": false,
+  "llama_backend": null,
+  "backend": "cuda",
+  "backend_request": "auto",
+  "asset_sha256": "a57df68755499dcd19cbd6a57220479240c9f8bc2f682a9d30155b5a0833545d",
+  "runtime_asset": null,
+  "source": "published",
+  "binary_repo": "unslothai/llama.cpp",
+  "binary_release_tag": "b12340-mix-6186f42",
+  "source_asset": "llama.cpp-source-commit-b8645ddda1dcce4172b413124f8ed85e7466316a.tar.gz",
+  "source_sha256": "d6e65f5111764a2bc855d86d0a293292da45f4e2648344c2b63f52cf9983187a",
+  "source_commit": "b8645ddda1dcce4172b413124f8ed85e7466316a",
+  "source_commit_short": "b8645dd",
+  "source_repo": "unslothai/llama.cpp",
+  "source_repo_url": "https://github.com/unslothai/llama.cpp",
+  "source_ref_kind": null,
+  "requested_source_ref": "b12340-mix-6186f42",
+  "resolved_source_ref": "b12340-mix-6186f42",
+  "ggml_tree": "affd5ee20a356aad78c5c92bd0742314bb19e8a5",
+  "bundle_profile": "cuda13-newer",
+  "runtime_line": "cuda13",
+  "torch_runtime_preference": "cuda13",
+  "coverage_class": "newer",
+  "gfx_target": null,
+  "mapped_targets": [],
+  "supported_sms": [
+    "86",
+    "89",
+    "90",
+    "100",
+    "103",
+    "120"
+  ],
+  "runtime_sha256": null,
+  "install_fingerprint": "7c0da0076057568f779d20c2a506e42285bbd36be9fc960789944c96750c7438",
+  "runtime_files": {
+    "build/bin/Release/llama-server.exe": {
+      "size": 26944,
+      "mtime_ns": 1794588007972566100,
+      "sha256": "05a2c7ad3923564f72d0c4806dbed9ab488762111f45042830a85863368f5654"
+    },
+    "build/bin/Release/llama-quantize.exe": {
+      "size": 26944,
+      "mtime_ns": 1794588007938314200,
+      "sha256": "845268a169f87e634d86d0e046fbde153b08da8f4d4bc6e2908f7e30d82f81df"
+    },
+    "build/bin/Release/llama-diffusion-gemma-visual-server.exe": {
+      "size": 73536,
+      "mtime_ns": 1794588007912396700,
+      "sha256": "2d29d7d9f07574010368d6f998e6110a56e3ab5d10662f2420eb9a3936381801"
+    },
+    "build/bin/Release/llama-bench.exe": {
+      "size": 26944,
+      "mtime_ns": 1794588007832655900
+    },
+    "build/bin/Release/ggml-base.dll": {
+      "size": 753472,
+      "mtime_ns": 1794588006945328300
+    },
+    "build/bin/Release/ggml-cpu-alderlake.dll": {
+      "size": 1149760,
+      "mtime_ns": 1794588006952404700
+    },
+    "build/bin/Release/ggml-cpu-cannonlake.dll": {
+      "size": 1268032,
+      "mtime_ns": 1794588006957911300
+    },
+    "build/bin/Release/ggml-cpu-cascadelake.dll": {
+      "size": 1270592,
+      "mtime_ns": 1794588006963530000
+    },
+    "build/bin/Release/ggml-cpu-haswell.dll": {
+      "size": 1151296,
+      "mtime_ns": 1794588006969843100
+    },
+    "build/bin/Release/ggml-cpu-icelake.dll": {
+      "size": 1270592,
+      "mtime_ns": 1794588006975893000
+    },
+    "build/bin/Release/ggml-cpu-sandybridge.dll": {
+      "size": 1131840,
+      "mtime_ns": 1794588006981434900
+    },
+    "build/bin/Release/ggml-cpu-skylakex.dll": {
+      "size": 1268032,
+      "mtime_ns": 1794588006987974000
+    },
+    "build/bin/Release/ggml-cpu-sse42.dll": {
+      "size": 899392,
+      "mtime_ns": 1794588006992493700
+    },
+    "build/bin/Release/ggml-cpu-x64.dll": {
+      "size": 900928,
+      "mtime_ns": 1794588006997510200
+    },
+    "build/bin/Release/ggml-cuda.dll": {
+      "size": 266827584,
+      "mtime_ns": 1794588007819527600
+    },
+    "build/bin/Release/ggml-rpc.dll": {
+      "size": 229184,
+      "mtime_ns": 1794588007823552300
+    },
+    "build/bin/Release/ggml.dll": {
+      "size": 76096,
+      "mtime_ns": 1794588007824560600
+    },
+    "build/bin/Release/llama-batched-bench-impl.dll": {
+      "size": 147264,
+      "mtime_ns": 1794588007827073200
+    },
+    "build/bin/Release/llama-bench-impl.dll": {
+      "size": 926528,
+      "mtime_ns": 1794588007831649500
+    },
+    "build/bin/Release/llama-cli-impl.dll": {
+      "size": 2056000,
+      "mtime_ns": 1794588007843780100
+    },
+    "build/bin/Release/llama-common.dll": {
+      "size": 10356032,
+      "mtime_ns": 1794588007902842200
+    },
+    "build/bin/Release/llama-completion-impl.dll": {
+      "size": 345920,
+      "mtime_ns": 1794588007905026500
+    },
+    "build/bin/Release/llama-fit-params-impl.dll": {
+      "size": 138560,
+      "mtime_ns": 1794588007914096900
+    },
+    "build/bin/Release/llama-perplexity-impl.dll": {
+      "size": 361792,
+      "mtime_ns": 1794588007932254500
+    },
+    "build/bin/Release/llama-quantize-impl.dll": {
+      "size": 356160,
+      "mtime_ns": 1794588007937308900
+    },
+    "build/bin/Release/llama-server-impl.dll": {
+      "size": 8921920,
+      "mtime_ns": 1794588007970555600
+    },
+    "build/bin/Release/llama.dll": {
+      "size": 3322176,
+      "mtime_ns": 1794588007991541200
+    },
+    "build/bin/Release/mtmd.dll": {
+      "size": 3037504,
+      "mtime_ns": 1794588008005073700
+    }
+  },
+  "host_profile": {
+    "machine": "amd64",
+    "has_usable_nvidia": true,
+    "has_physical_nvidia": true,
+    "driver_cuda_version": [
+      13,
+      4
+    ],
+    "compute_caps": [
+      "120"
+    ],
+    "has_rocm": false,
+    "rocm_runtime": null,
+    "rocm_gfx_target": null,
+    "rocm_gfx_targets": [],
+    "has_intel_gpu": false,
+    "has_amd_gpu_without_rocm": false,
+    "macos_version": null,
+    "cuda_runtime_lines": [
+      "cuda12",
+      "cuda13"
+    ]
+  },
+  "prebuilt_fallback_used": false,
+  "installed_at_utc": "2026-11-13T16:40:08Z"
+}
