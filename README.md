@@ -8,6 +8,8 @@ Every accepted engine change is meant to be **lossless**: with greedy decoding, 
 
 Speculative decoding is a separate matter. With a drafter, every emitted token is still the target model's own greedy choice, but a multi-token verify batch rounds differently from a single-token step, so the text can diverge from the no-draft run where two candidate tokens are nearly tied.
 
+The full story, with every chart and the experiments that failed, is in the write-up: [The Art of Moving Bytes](https://0xe2e.github.io/qwen-next-blog/).
+
 ## Results
 
 Measured on the machine above at a 90,000-token context window. Tokens per second, greedy decoding, one user.
@@ -94,6 +96,7 @@ Requirements: a CUDA GPU with about 15 GB of usable VRAM, enough RAM to hold the
 ## Repository layout
 
 - `engine/` — the engine: llama.cpp source with the qwen-next changes (MIT, see `engine/LICENSE`).
+- `LICENSE` — MIT for everything in this repository; `engine/` keeps llama.cpp's own MIT licence and authors list.
 - `start-qwen-next.ps1` — starter with the accepted profile.
 - `docs/` — design and contract documents, build instructions.
 - `tools/` — generic utilities (routing-trace cache simulator, hardware probes in `tools/probes/`).
