@@ -60,11 +60,31 @@ Things that were built, measured and shelved are part of the record too: for exa
 ## Quick start
 
 1. Build the engine: see [docs/BUILD.md](docs/BUILD.md).
-2. Get the model: the `UD-IQ3_XXS` GGUF shards of Qwen3.8-Flash-Next and, for speculative decoding, the DFlash 2 drafter GGUF (`Q4_K_M` is enough; the 8-bit file accepted no more drafts here). The MTP draft GGUF is optional.
-3. Start the server:
+2. Get the files (any folder; the script takes paths):
+   - the model: the four `UD-IQ3_XXS` shards from [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (83.6 GB in total);
+   - the drafter: `Qwen3.8-Flash-Next-DFlash2-Q4_K_M.gguf` from [incoai/Qwen3.8-Flash-Next-DFlash2-GGUF](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2-GGUF) (0.36 GB; the 8-bit file accepted no more drafts here);
+   - optional: `mtp-Qwen3.8-Flash-Next-Q8_0.gguf` from the Unsloth repo, only for the `-Mtp` profile.
+3. Start the server, passing the first shard and the drafter:
 
 ```powershell
-.\start-qwen-next.ps1 -Model <path to first GGUF shard> -DFlash <path to DFlash 2 drafter GGUF>
+.\start-qwen-next.ps1 `
+    -Model  D:\models\Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf `
+    -DFlash D:\models\Qwen3.8-Flash-Next-DFlash2-Q4_K_M.gguf
+```
+
+   Or set the paths once and run it with no arguments:
+
+```powershell
+$env:QNEXT_MODEL  = 'D:\models\Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf'
+$env:QNEXT_DFLASH = 'D:\models\Qwen3.8-Flash-Next-DFlash2-Q4_K_M.gguf'
+.\start-qwen-next.ps1
+```
+
+4. Check it: the server speaks the usual llama.cpp / OpenAI-compatible HTTP API.
+
+```powershell
+curl.exe http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" `
+    -d '{\"messages\":[{\"role\":\"user\",\"content\":\"Say hi in three words.\"}],\"max_tokens\":200}'
 ```
 
 The script prints the exact command line and environment it uses. Useful options: `-Mtp -Draft <MTP draft GGUF>` (draft with the model's own MTP block), `-NoDraft`, `-Context 64000`, `-Port 8081`, `-Stock` (the seed's original flags, for comparison), `-DryRun`. The server speaks the usual llama.cpp HTTP API on `http://127.0.0.1:8080`.
