@@ -14,14 +14,20 @@ Categories:
 
 ## Recommended profile
 
-Flags: `--ubatch-size 2048 --moe-cache-mib auto --checkpoint-min-step 1024 --backend-sampling --spec-type draft-mtp
---spec-draft-n-max 2 --spec-draft-cpu-moe --spec-draft-n-ubatch 512 -td 8 -tbd 8`, plus the draft model.
+Flags (default, DFlash 2 drafter): `--ubatch-size 2048 --moe-cache-mib auto --checkpoint-min-step 1024
+--backend-sampling --spec-type draft-dflash --spec-draft-n-max 2 --spec-draft-n-ubatch 256 -td 8 -tbd 8`, plus the
+drafter with `--model-draft`. The small draft batch matters: with the default one the drafter's buffers take about
+1.9 GiB that the expert cache needs. The `QNEXT_MTP_*` switches below do nothing with this drafter.
 
-Environment:
+Flags (MTP draft block, `-Mtp` in the starter): `... --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-cpu-moe
+--spec-draft-n-ubatch 512 -td 8 -tbd 8`, plus the MTP draft model, with `QNEXT_MTP_PRUNE=1 QNEXT_MTP_CROP=1` added
+to the environment.
+
+Environment (both):
 
 ```
 QNEXT_MOE_BIGBATCH_BYPASS=1 QNEXT_MOE_BATCH_COPY=1 QNEXT_ELASTIC_KV=3 QNEXT_PF_OVERLAP=1 QNEXT_PF_OVERLAP_SLOTS=3
-QNEXT_IDS_ASYNC=1 QNEXT_MTP_PRUNE=1 QNEXT_MTP_CROP=1 QNEXT_ELASTIC_COMPUTE=1 QNEXT_MOE_LOOKAHEAD=4
+QNEXT_IDS_ASYNC=1 QNEXT_ELASTIC_COMPUTE=1 QNEXT_MOE_LOOKAHEAD=4
 QNEXT_MOE_LOOKAHEAD_MAX_MIB=24 QNEXT_MOE_LOOKAHEAD_RANK=1 QNEXT_MOE_LOOKAHEAD_ISSUE=post QNEXT_MOE_LOOKAHEAD_P4_FAST=1
 QNEXT_MOE_MISS_OVERLAP=1
 ```
